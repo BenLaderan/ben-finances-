@@ -37,20 +37,29 @@ def gh_write(path, content, sha, msg):
     return r.status_code in (200, 201)
 
 
-def parse_table(content, section):
+def parse_table(content, start, stops):
+    """ดึง data rows จาก markdown table ระหว่าง start marker และ stop markers"""
     rows = []
-    in_section = False
+    capturing = False
+    header_done = False
     for line in content.split("\n"):
-        if section in line:
-            in_section = True
+        if not capturing:
+            if start in line:
+                capturing = True
             continue
-        if in_section and line.startswith("## ") and section not in line:
+        if any(s in line for s in stops):
             break
-        if in_section and line.startswith("| ") and "---" not in line:
-            cells = [c.strip().strip("*") for c in line.split("|")[1:-1]]
-            if any(c.strip() for c in cells):
-                rows.append(cells)
-    return rows[1:] if len(rows) > 1 else []
+        if "|" not in line or "---" in line:
+            continue
+        cells = [c.strip().strip("*") for c in line.split("|")[1:-1]]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        if not header_done:
+            header_done = True
+            continue
+        rows.append(cells)
+    return rows
 
 
 def handle_ledger(text):
@@ -118,22 +127,23 @@ def handle_assets():
 
     lines_out = ["💼 <b>สินทรัพย์ของเบน</b>", ""]
 
-    # เงินสด/บัญชี
-    cash_rows = parse_table(content, "เงินในบัญชี")
+    # เงินสด/บัญชี — หยุดที่ ## ถัดไป
+    cash_rows = parse_table(content, "เงินในบัญชี", ["## 📈", "## 🪙", "## 💸"])
     if cash_rows:
         lines_out.append("🏦 <b>เงินสด / บัญชี</b>")
         for r in cash_rows:
-            if len(r) >= 2:
-                name, amount = r[0].strip(), r[1].strip()
-                if name.startswith("รวม"):
-                    lines_out.append("━━━━━━━━━━━━")
-                    lines_out.append(f"💵 รวม: <b>{amount} ฿</b>")
-                else:
-                    lines_out.append(f"  • {name}: {amount} ฿")
+            if len(r) < 2:
+                continue
+            name, amount = r[0], r[1]
+            if name.startswith("รวม"):
+                lines_out.append("━━━━━━━━━━")
+                lines_out.append(f"💵 รวม: <b>{amount} ฿</b>")
+            else:
+                lines_out.append(f"  • {name}: {amount} ฿")
         lines_out.append("")
 
-    # หุ้น SET
-    set_rows = parse_table(content, "### SET")
+    # หุ้น SET — หยุดที่ ### NYSE หรือ ## ถัดไป
+    set_rows = parse_table(content, "### SET", ["### NYSE", "## 🪙", "## 💸"])
     if set_rows:
         lines_out.append("📈 <b>หุ้น SET</b>")
         for r in set_rows:
@@ -141,8 +151,8 @@ def handle_assets():
                 lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ฿{r[2]}")
         lines_out.append("")
 
-    # หุ้น US
-    us_rows = parse_table(content, "NYSE / NASDAQ")
+    # หุ้น US — หยุดที่ ## ถัดไป
+    us_rows = parse_table(content, "NYSE / NASDAQ", ["## 🪙", "## 💸", "## 🏦"])
     if us_rows:
         lines_out.append("📈 <b>หุ้น US</b>")
         for r in us_rows:
@@ -150,23 +160,26 @@ def handle_assets():
                 lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ${r[2]}")
         lines_out.append("")
 
-    # กองทุน
-    fund_rows = parse_table(content, "กองทุน")
+    # กองทุน — หยุดที่ ## ถัดไป
+    fund_rows = parse_table(content, "🪙 กองทุน", ["## 💸", "## 📈", "## 🏦"])
     if fund_rows:
         lines_out.append("🪙 <b>กองทุน</b>")
         for r in fund_rows:
             if len(r) >= 4:
                 lines_out.append(f"  • {r[0]}: DCA ฿{r[3]} {r[2]}")
+            elif len(r) >= 2:
+                lines_out.append(f"  • {r[0]}: {r[1]} ฿")
         lines_out.append("")
 
-    # หนี้สิน
-    debt_rows = parse_table(content, "หนี้สิน")
+    # หนี้สิน — หยุดที่ end หรือ ## ถัดไป
+    debt_rows = parse_table(content, "💸 หนี้สิน", ["## 📈", "## 🏦", "## 🪙"])
     if debt_rows:
         lines_out.append("💸 <b>หนี้สิน</b>")
         for r in debt_rows:
-            if len(r) >= 2 and not r[0].startswith("รวม"):
-                note = f"  ({r[3]})" if len(r) > 3 and r[3].strip() else ""
-                lines_out.append(f"  • {r[0]}: {r[1]} ฿{note}")
+            if len(r) < 2 or r[0].startswith("รวม"):
+                continue
+            note = f"  ({r[3]})" if len(r) > 3 and r[3].strip() else ""
+            lines_out.append(f"  • {r[0]}: {r[1]} ฿{note}")
         lines_out.append("")
 
     send("\n".join(lines_out))
