@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # e.g. benladean/ben-finances
-ALLOWED_CHAT_ID = os.environ.get("CHAT_ID")  # 8711576571
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
+ALLOWED_CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
@@ -37,8 +37,23 @@ def gh_write(path, content, sha, msg):
     return r.status_code in (200, 201)
 
 
+def parse_table(content, section):
+    rows = []
+    in_section = False
+    for line in content.split("\n"):
+        if section in line:
+            in_section = True
+            continue
+        if in_section and line.startswith("## ") and section not in line:
+            break
+        if in_section and line.startswith("| ") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.split("|")[1:-1]]
+            if any(c.strip() for c in cells):
+                rows.append(cells)
+    return rows[1:] if len(rows) > 1 else []
+
+
 def handle_ledger(text):
-    # รูปแบบ: +500 ค่ากาแฟ  หรือ  -200 ค่าข้าว
     m = re.match(r"^([+-])(\d+(?:\.\d+)?)\s+(.+)$", text.strip())
     if not m:
         return False
@@ -55,7 +70,8 @@ def handle_ledger(text):
     ok = gh_write("finances/ledger.csv", content + new_row, sha, f"ledger: {entry_type} {amount} {note}")
     if ok:
         emoji = "💰" if sign == "+" else "💸"
-        send(f"{emoji} <b>บันทึกแล้ว</b>\nประเภท: {entry_type}\nจำนวน: {amount} บาท\nหมายเหตุ: {note}\nวันที่: {today}")
+        type_th = "รายรับ" if sign == "+" else "รายจ่าย"
+        send(f"{emoji} <b>บันทึกแล้ว</b>\nประเภท: {type_th}\nจำนวน: {amount} บาท\nหมายเหตุ: {note}\nวันที่: {today}")
     else:
         send("❌ บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง")
     return True
@@ -66,7 +82,7 @@ def handle_summary():
     if not content:
         send("❌ ไม่พบข้อมูล")
         return
-    lines = content.strip().split("\n")[1:]  # skip header
+    lines = content.strip().split("\n")[1:]
     this_month = datetime.now().strftime("%Y-%m")
     income = expense = 0.0
     for line in lines:
@@ -94,6 +110,68 @@ def handle_summary():
     )
 
 
+def handle_assets():
+    content, _ = gh_read("finances/assets.md")
+    if not content:
+        send("❌ ไม่พบไฟล์ assets.md")
+        return
+
+    lines_out = ["💼 <b>สินทรัพย์ของเบน</b>", ""]
+
+    # เงินสด/บัญชี
+    cash_rows = parse_table(content, "เงินในบัญชี")
+    if cash_rows:
+        lines_out.append("🏦 <b>เงินสด / บัญชี</b>")
+        for r in cash_rows:
+            if len(r) >= 2:
+                name, amount = r[0].strip(), r[1].strip()
+                if name.startswith("รวม"):
+                    lines_out.append("━━━━━━━━━━━━")
+                    lines_out.append(f"💵 รวม: <b>{amount} ฿</b>")
+                else:
+                    lines_out.append(f"  • {name}: {amount} ฿")
+        lines_out.append("")
+
+    # หุ้น SET
+    set_rows = parse_table(content, "### SET")
+    if set_rows:
+        lines_out.append("📈 <b>หุ้น SET</b>")
+        for r in set_rows:
+            if len(r) >= 3:
+                lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ฿{r[2]}")
+        lines_out.append("")
+
+    # หุ้น US
+    us_rows = parse_table(content, "NYSE / NASDAQ")
+    if us_rows:
+        lines_out.append("📈 <b>หุ้น US</b>")
+        for r in us_rows:
+            if len(r) >= 3:
+                lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ${r[2]}")
+        lines_out.append("")
+
+    # กองทุน
+    fund_rows = parse_table(content, "กองทุน")
+    if fund_rows:
+        lines_out.append("🪙 <b>กองทุน</b>")
+        for r in fund_rows:
+            if len(r) >= 4:
+                lines_out.append(f"  • {r[0]}: DCA ฿{r[3]} {r[2]}")
+        lines_out.append("")
+
+    # หนี้สิน
+    debt_rows = parse_table(content, "หนี้สิน")
+    if debt_rows:
+        lines_out.append("💸 <b>หนี้สิน</b>")
+        for r in debt_rows:
+            if len(r) >= 2 and not r[0].startswith("รวม"):
+                note = f"  ({r[3]})" if len(r) > 3 and r[3].strip() else ""
+                lines_out.append(f"  • {r[0]}: {r[1]} ฿{note}")
+        lines_out.append("")
+
+    send("\n".join(lines_out))
+
+
 HELP_TEXT = (
     "📋 <b>คำสั่งทั้งหมด</b>\n\n"
     "<b>บัญชี:</b>\n"
@@ -104,87 +182,6 @@ HELP_TEXT = (
     "/assets — ดูสรุปสินทรัพย์\n\n"
     "/help — แสดงเมนูนี้"
 )
-
-
-def parse_table_rows(content, section_header):
-    """ดึง rows จาก markdown table ใต้ section ที่กำหนด"""
-    rows = []
-    in_section = False
-    in_table = False
-    for line in content.split("\n"):
-        if section_header in line:
-            in_section = True
-            in_table = False
-            continue
-        if in_section and line.startswith("## "):
-            break
-        if in_section and line.startswith("| ") and "---" not in line:
-            cells = [c.strip().strip("*") for c in line.split("|")[1:-1]]
-            if any(cells):
-                rows.append(cells)
-    return rows[1:] if rows else []  # skip header row
-
-
-def handle_assets():
-    content, _ = gh_read("finances/assets.md")
-    if not content:
-        send("❌ ไม่พบไฟล์ assets.md")
-        return
-
-    lines_out = ["💼 <b>สินทรัพย์ของเบน</b>", ""]
-
-    # เงินสด/บัญชี
-    cash_rows = parse_table_rows(content, "เงินในบัญชี")
-    if cash_rows:
-        lines_out.append("🏦 <b>เงินสด / บัญชี</b>")
-        for r in cash_rows:
-            if len(r) >= 2:
-                name, amount = r[0], r[1]
-                if name.startswith("รวม"):
-                    lines_out.append(f"━━━━━━━━━━━━")
-                    lines_out.append(f"💵 รวม: <b>{amount} ฿</b>")
-                else:
-                    lines_out.append(f"  • {name}: {amount} ฿")
-        lines_out.append("")
-
-    # หุ้น SET
-    set_rows = parse_table_rows(content, "### SET")
-    if set_rows:
-        lines_out.append("📈 <b>หุ้น SET</b>")
-        for r in set_rows:
-            if len(r) >= 2:
-                lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ฿{r[2]}")
-        lines_out.append("")
-
-    # หุ้น US
-    us_rows = parse_table_rows(content, "NYSE / NASDAQ")
-    if us_rows:
-        lines_out.append("📈 <b>หุ้น US</b>")
-        for r in us_rows:
-            if len(r) >= 2:
-                lines_out.append(f"  • {r[0]}: {r[1]} หุ้น @ ${r[2]}")
-        lines_out.append("")
-
-    # กองทุน
-    fund_rows = parse_table_rows(content, "กองทุน")
-    if fund_rows:
-        lines_out.append("🪙 <b>กองทุน</b>")
-        for r in fund_rows:
-            if len(r) >= 3:
-                lines_out.append(f"  • {r[0]}: DCA ฿{r[3]}/{r[2].replace('ทุก','').strip()}")
-        lines_out.append("")
-
-    # หนี้สิน
-    debt_rows = parse_table_rows(content, "หนี้สิน")
-    if debt_rows:
-        lines_out.append("💸 <b>หนี้สิน</b>")
-        for r in debt_rows:
-            if len(r) >= 2 and not r[0].startswith("รวม"):
-                note = r[3] if len(r) > 3 else ""
-                lines_out.append(f"  • {r[0]}: {r[1]} ฿  {note}")
-        lines_out.append("")
-
-    send("\n".join(lines_out))
 
 
 class handler(BaseHTTPRequestHandler):
