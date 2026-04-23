@@ -305,6 +305,172 @@ def update_assets_on_ledger(content, sha, account, delta, debt_name=None):
     return acct_old, acct_new, debt_old, debt_new, old_car_note, new_car_note
 
 
+# ─── Stock trade helpers ─────────────────────────────────────────────────────
+
+US_SYMBOLS = {
+    "DOCN", "VOO", "ASTS", "SOFI", "NVDA", "TSM", "AVGO",
+    "MU", "AMD", "CIEN", "PLTR", "SPY", "QQQ", "AAPL", "MSFT",
+    "GOOGL", "AMZN", "META", "TSLA", "BRK.B",
+}
+
+
+def _fmt_shares(n):
+    if n == int(n):
+        return f"{int(n):,}"
+    return f"{n:.7g}"
+
+
+def _trade_update(lines, ticker, trade_qty, price, is_buy, is_us):
+    """Buy/sell stock in assets.md lines.
+    Returns (new_lines, old_qty, old_cost, new_qty, new_cost, pnl).
+    """
+    section_start = "### NYSE / NASDAQ" if is_us else "### SET"
+    section_stops = ["## 🪙", "## 💸"] + ([] if is_us else ["### NYSE"])
+
+    in_sec = False
+    row_idx = -1
+    last_data_idx = -1
+    old_qty = old_cost = None
+
+    for i, line in enumerate(lines):
+        if section_start in line:
+            in_sec = True
+            continue
+        if in_sec and line.strip() and any(s in line for s in section_stops):
+            in_sec = False
+        if in_sec and line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if not cells or cells[0] in ("Ticker", ""):
+                continue
+            last_data_idx = i
+            if cells[0].upper() == ticker and len(cells) >= 3:
+                row_idx = i
+                old_qty = _parse_num(cells[1])
+                old_cost = _parse_num(cells[2])
+
+    # Compute new values
+    pnl = None
+    if is_buy:
+        if old_qty is not None and old_cost is not None:
+            new_qty = old_qty + trade_qty
+            new_cost = (old_cost * old_qty + price * trade_qty) / new_qty
+        else:
+            new_qty, new_cost = trade_qty, price
+    else:
+        if old_qty is None:
+            return lines, None, None, None, None, None
+        new_qty = old_qty - trade_qty
+        new_cost = old_cost or price
+        if old_cost is not None:
+            pnl = (price - old_cost) * trade_qty
+
+    result = list(lines)
+
+    if row_idx >= 0:
+        if new_qty <= 0:
+            del result[row_idx]
+        else:
+            parts = result[row_idx].split("|")
+            parts[2] = f" {_fmt_shares(new_qty)} "
+            parts[3] = f" {new_cost:.4f} "
+            result[row_idx] = "|".join(parts)
+    elif is_buy and new_qty > 0:
+        note = "NYSE" if ticker in {"DOCN", "VOO"} else ("NASDAQ" if is_us else "")
+        new_row = f"| {ticker} | {_fmt_shares(new_qty)} | {new_cost:.4f} | {note} |"
+        insert_at = last_data_idx + 1 if last_data_idx >= 0 else len(result)
+        result.insert(insert_at, new_row)
+
+    return result, old_qty, old_cost, new_qty, new_cost, pnl
+
+
+def handle_trade(text):
+    m = re.match(r"^(ซื้อ|ขาย)\s+(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$", text.strip())
+    if not m:
+        send("รูปแบบ: ซื้อ/ขาย [SYMBOL] [จำนวน] [ราคา]\nตัวอย่าง: ซื้อ AAV 1000 1.85")
+        return
+
+    action, ticker, qty_str, price_str = m.groups()
+    ticker = ticker.upper()
+    qty = float(qty_str)
+    price = float(price_str)
+    is_buy = action == "ซื้อ"
+
+    assets_content, assets_sha = gh_read("finances/assets.md")
+    if assets_content is None:
+        send("❌ ไม่พบไฟล์ assets.md")
+        return
+
+    # Detect market — existing table takes priority
+    set_rows = get_table(assets_content, "### SET", ["### NYSE", "## 🪙", "## 💸"])
+    us_rows = get_table(assets_content, "NYSE / NASDAQ", ["## 🪙", "## 💸"])
+    if any(r[0].upper() == ticker for r in set_rows if r):
+        is_us = False
+    elif any(r[0].upper() == ticker for r in us_rows if r):
+        is_us = True
+    else:
+        is_us = ticker in US_SYMBOLS or "." in ticker
+
+    lines = assets_content.split("\n")
+    lines, old_qty, old_cost, new_qty, new_cost, pnl = _trade_update(
+        lines, ticker, qty, price, is_buy, is_us
+    )
+
+    if old_qty is None and not is_buy:
+        send(f"❌ ไม่พบหุ้น {ticker} ในพอร์ต")
+        return
+
+    # Adjust เงินในพอร์ตลงทุน
+    if is_us:
+        usdthb = get_price("USDTHB=X") or USDTHB_RATE
+        total_thb = qty * price * usdthb
+    else:
+        total_thb = qty * price
+    portfolio_delta = -total_thb if is_buy else total_thb
+    lines, port_old, port_new = _apply_row_delta(lines, "เงินในพอร์ตลงทุน", portfolio_delta)
+
+    # Recalculate totals
+    lines, _ = _recalc_total(lines, "## 🏦", "รวมเงินสด/บัญชี")
+    lines = _recalc_net_worth_row(lines)
+    gh_write("finances/assets.md", "\n".join(lines), assets_sha,
+             f"assets: {'buy' if is_buy else 'sell'} {ticker} {qty}@{price}")
+
+    # Write ledger
+    today = datetime.now().strftime("%Y-%m-%d")
+    ledger_content, ledger_sha = gh_read("finances/ledger.csv")
+    if ledger_content:
+        entry_type = "expense" if is_buy else "income"
+        new_row = f"{today},{entry_type},stock,{qty * price:.2f},{'ซื้อ' if is_buy else 'ขาย'} {ticker}\n"
+        gh_write("finances/ledger.csv", ledger_content + new_row, ledger_sha,
+                 f"ledger: {'ซื้อ' if is_buy else 'ขาย'} {ticker}")
+
+    # Build response
+    cur = "$" if is_us else "฿"
+    today_str = today
+    if is_buy:
+        old_qty_str = _fmt_shares(old_qty) if old_qty else "0"
+        old_cost_str = f"{cur}{old_cost:.2f}" if old_cost else "ใหม่"
+        parts = [
+            "🛒 <b>ซื้อหุ้นแล้ว</b>",
+            f"{ticker}: {old_qty_str} → {_fmt_shares(new_qty)} หุ้น",
+            f"ต้นทุนเฉลี่ย: {old_cost_str} → {cur}{new_cost:.2f}",
+        ]
+    else:
+        new_qty_str = _fmt_shares(new_qty) if new_qty > 0 else "0 (ขายหมด)"
+        parts = [
+            "💰 <b>ขายหุ้นแล้ว</b>",
+            f"{ticker}: {_fmt_shares(old_qty)} → {new_qty_str} หุ้น",
+            f"ราคาขาย: {cur}{price:.2f}" + (f" | ต้นทุน: {cur}{old_cost:.2f}" if old_cost else ""),
+        ]
+        if pnl is not None:
+            pnl_str = f"+{cur}{pnl:.2f}" if pnl >= 0 else f"-{cur}{abs(pnl):.2f}"
+            parts.append(f"กำไร: {pnl_str}")
+
+    if port_old is not None and port_new is not None:
+        parts.append(f"เงินในพอร์ต: {port_old:,.2f} → {port_new:,.2f} ฿")
+    parts.append(f"วันที่: {today_str}")
+    send("\n".join(parts))
+
+
 # ─── Command handlers ─────────────────────────────────────────────────────────
 
 def detect_debt(note):
@@ -627,7 +793,10 @@ HELP_TEXT = (
     "/summary — สรุปรายรับจ่ายเดือนนี้\n\n"
     "<b>พอร์ต:</b>\n"
     "/assets — ดูสรุปสินทรัพย์\n"
-    "/fund SCBworld 788.53 — อัพเดทมูลค่ากองทุน\n\n"
+    "/fund SCBworld 788.53 — อัพเดทมูลค่ากองทุน\n"
+    "ซื้อ AAV 1000 1.85 — ซื้อหุ้น SET\n"
+    "ซื้อ DOCN 0.5 95.00 — ซื้อหุ้น US\n"
+    "ขาย GULF 10 52.00 — ขายหุ้น\n\n"
     "/help — แสดงเมนูนี้"
 )
 
@@ -648,7 +817,9 @@ class handler(BaseHTTPRequestHandler):
         text = message.get("text", "").strip()
         if not text or chat_id != ALLOWED_CHAT_ID:
             return
-        if re.match(r"^[+-]\d", text):
+        if re.match(r"^(ซื้อ|ขาย)\s", text):
+            handle_trade(text)
+        elif re.match(r"^[+-]\d", text):
             handle_ledger(text)
         elif text == "/summary":
             handle_summary()
