@@ -13,6 +13,18 @@ ALLOWED_CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
+ACCOUNT_MAP = {
+    "บัญชีเงินเย็น": "บัญชีเงินเย็น",
+    "บัญชีใช้งาน": "บัญชีใช้งาน",
+    "Prepaid Card": "Prepaid Card",
+    "prepaid card": "Prepaid Card",
+    "prepaid": "Prepaid Card",
+    "เงินสด": "เงินสด",
+    "เงินในพอร์ตลงทุน": "เงินในพอร์ตลงทุน",
+    "พอร์ต": "เงินในพอร์ตลงทุน",
+}
+DEFAULT_ACCOUNT = "บัญชีใช้งาน"
+
 
 def send(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -53,25 +65,102 @@ def get_table(content, start, stops):
     return rows[1:] if len(rows) > 1 else []
 
 
+def update_assets_balance(account_name, delta):
+    content, sha = gh_read("finances/assets.md")
+    if content is None:
+        return None
+
+    lines = content.split("\n")
+    new_balance = None
+    updated = []
+
+    for line in lines:
+        if line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if cells and cells[0] == account_name and len(cells) >= 2:
+                try:
+                    current = float(cells[1].replace(",", ""))
+                    new_balance = current + delta
+                    parts = line.split("|")
+                    parts[2] = f" {new_balance:,.2f} "
+                    line = "|".join(parts)
+                except ValueError:
+                    pass
+        updated.append(line)
+
+    if new_balance is None:
+        return None
+
+    # Recalculate cash total
+    total = 0.0
+    in_cash = False
+    for line in updated:
+        if "## 🏦" in line:
+            in_cash = True
+        elif in_cash and line.startswith("## "):
+            in_cash = False
+        elif in_cash and line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if cells and cells[0] and not cells[0].startswith("รวม") and cells[0] != "รายการ" and len(cells) >= 2:
+                try:
+                    total += float(cells[1].replace(",", ""))
+                except ValueError:
+                    pass
+
+    final = []
+    for line in updated:
+        if line.startswith("|") and "รวมเงินสด/บัญชี" in line:
+            parts = line.split("|")
+            parts[2] = f" **{total:,.2f}** "
+            line = "|".join(parts)
+        final.append(line)
+
+    gh_write("finances/assets.md", "\n".join(final), sha, f"assets: {account_name} {delta:+.2f}")
+    return new_balance
+
+
 def handle_ledger(text):
-    m = re.match(r"^([+-])(\d+(?:\.\d+)?)\s+(.+)$", text.strip())
+    m = re.match(r"^([+-])(\d+(?:\.\d+)?)\s+(.+?)(?:\s+\[(.+?)\])?\s*$", text.strip())
     if not m:
         return False
-    sign, amount, note = m.groups()
+    sign, amount, note, acct_raw = m.groups()
+
+    account = DEFAULT_ACCOUNT
+    if acct_raw:
+        account = ACCOUNT_MAP.get(acct_raw.strip(), acct_raw.strip())
+
     entry_type = "income" if sign == "+" else "expense"
     today = datetime.now().strftime("%Y-%m-%d")
     new_row = f"{today},{entry_type},general,{amount},{note}\n"
+
     content, sha = gh_read("finances/ledger.csv")
     if content is None:
         send("❌ ไม่พบไฟล์ ledger.csv")
         return True
     ok = gh_write("finances/ledger.csv", content + new_row, sha, f"ledger: {entry_type} {amount} {note}")
-    if ok:
-        emoji = "💰" if sign == "+" else "💸"
-        type_th = "รายรับ" if sign == "+" else "รายจ่าย"
-        send(f"{emoji} <b>บันทึกแล้ว</b>\nประเภท: {type_th}\nจำนวน: {amount} บาท\nหมายเหตุ: {note}\nวันที่: {today}")
+    if not ok:
+        send("❌ บันทึก ledger ไม่สำเร็จ")
+        return True
+
+    delta = float(amount) if sign == "+" else -float(amount)
+    new_balance = update_assets_balance(account, delta)
+
+    emoji = "💰" if sign == "+" else "💸"
+    type_th = "รายรับ" if sign == "+" else "รายจ่าย"
+
+    if new_balance is not None:
+        bal_line = f"บัญชี: {account} → {new_balance:,.2f} ฿"
     else:
-        send("❌ บันทึกไม่สำเร็จ")
+        bal_line = f"บัญชี: {account} (อัพเดท assets ไม่สำเร็จ)"
+
+    send(
+        f"{emoji} <b>บันทึกแล้ว</b>\n"
+        f"ประเภท: {type_th}\n"
+        f"จำนวน: {amount} บาท\n"
+        f"หมายเหตุ: {note}\n"
+        f"{bal_line}\n"
+        f"วันที่: {today}"
+    )
     return True
 
 
@@ -162,8 +251,10 @@ def handle_assets():
 HELP_TEXT = (
     "📋 <b>คำสั่งทั้งหมด</b>\n\n"
     "<b>บัญชี:</b>\n"
-    "+500 ค่ากาแฟ — บันทึกรายรับ\n"
-    "-200 ค่าอาหาร — บันทึกรายจ่าย\n"
+    "+500 เงินเดือน — บันทึกรายรับ (ตัด บัญชีใช้งาน)\n"
+    "-200 ค่าอาหาร — บันทึกรายจ่าย (ตัด บัญชีใช้งาน)\n"
+    "-200 ค่าอาหาร [เงินสด] — ระบุบัญชี\n"
+    "บัญชีที่รองรับ: บัญชีเงินเย็น, บัญชีใช้งาน, Prepaid Card, เงินสด, เงินในพอร์ตลงทุน\n\n"
     "/summary — สรุปรายรับจ่ายเดือนนี้\n\n"
     "<b>พอร์ต:</b>\n"
     "/assets — ดูสรุปสินทรัพย์\n\n"
