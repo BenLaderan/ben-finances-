@@ -3,6 +3,7 @@ import os
 import base64
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 
@@ -31,6 +32,36 @@ DEBT_KEYWORDS = {
 }
 
 USDTHB_RATE = 36.5
+
+YF_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+# ─── Yahoo Finance ────────────────────────────────────────────────────────────
+
+def get_price(symbol):
+    """Fetch current price from Yahoo Finance. Returns float or None."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        r = requests.get(url, headers=YF_HEADERS, timeout=5)
+        if r.status_code == 200:
+            return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    except Exception:
+        pass
+    return None
+
+
+def get_prices(symbols):
+    """Fetch multiple prices in parallel. Returns {symbol: price_or_None}."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(symbols)) as ex:
+        futures = {ex.submit(get_price, s): s for s in symbols}
+        for f in as_completed(futures, timeout=8):
+            s = futures[f]
+            try:
+                results[s] = f.result()
+            except Exception:
+                results[s] = None
+    return results
 
 
 # ─── GitHub helpers ───────────────────────────────────────────────────────────
@@ -381,9 +412,23 @@ def handle_assets():
         send("❌ ไม่พบไฟล์ assets.md")
         return
 
+    set_rows = get_table(content, "### SET", ["### NYSE", "## 🪙", "## 💸"])
+    us_rows = get_table(content, "NYSE / NASDAQ", ["## 🪙", "## 💸"])
+
+    # Fetch all prices in parallel
+    symbols = (
+        [f"{r[0]}.BK" for r in set_rows if len(r) >= 3] +
+        [r[0] for r in us_rows if len(r) >= 3] +
+        ["USDTHB=X"]
+    )
+    prices = get_prices(symbols) if symbols else {}
+    usdthb = prices.get("USDTHB=X") or USDTHB_RATE
+
     out = ["💼 <b>สินทรัพย์ของเบน</b>", ""]
 
+    # ── เงินสด / บัญชี ──
     cash = get_table(content, "เงินในบัญชี", ["## 📈", "## 🪙", "## 💸"])
+    cash_total = 0.0
     if cash:
         out.append("🏦 <b>เงินสด / บัญชี</b>")
         for r in cash:
@@ -391,44 +436,108 @@ def handle_assets():
                 if r[0].startswith("รวม"):
                     out.append("━━━━━━━━━━━━")
                     out.append(f"💵 รวม: <b>{r[1]} ฿</b>")
+                    v = _parse_num(r[1])
+                    if v is not None:
+                        cash_total = v
                 else:
                     out.append(f"  • {r[0]}: {r[1]} ฿")
         out.append("")
 
-    set_rows = get_table(content, "### SET", ["### NYSE", "## 🪙", "## 💸"])
+    # ── หุ้น SET ──
+    set_market_thb = 0.0
     if set_rows:
         out.append("📈 <b>หุ้น SET</b>")
+        set_cost_total = 0.0
         for r in set_rows:
-            if len(r) >= 3:
-                out.append(f"  • {r[0]}: {r[1]} หุ้น @ ฿{r[2]}")
+            if len(r) < 3:
+                continue
+            ticker, shares_str, cost_str = r[0], r[1], r[2]
+            shares = _parse_num(shares_str)
+            cost = _parse_num(cost_str)
+            price = prices.get(f"{ticker}.BK")
+            if price is not None and shares is not None and cost is not None:
+                market = shares * price
+                cost_val = shares * cost
+                set_market_thb += market
+                set_cost_total += cost_val
+                out.append(
+                    f"  • {ticker}: {shares_str} หุ้น @ ฿{price:.2f} "
+                    f"(ต้นทุน ฿{cost_str}) | มูลค่า ฿{market:,.0f}"
+                )
+            else:
+                if shares is not None and cost is not None:
+                    set_cost_total += shares * cost
+                out.append(f"  • {ticker}: {shares_str} หุ้น @ ฿{cost_str} (ราคาไม่พร้อมใช้งาน)")
+        out.append("━━━━━━━━━━━━")
+        pnl = set_market_thb - set_cost_total
+        pnl_str = f"+฿{pnl:,.0f}" if pnl >= 0 else f"-฿{abs(pnl):,.0f}"
+        out.append(f"📊 รวมหุ้น SET: ฿{set_market_thb:,.0f} | กำไร/ขาดทุน: {pnl_str}")
         out.append("")
 
-    us_rows = get_table(content, "NYSE / NASDAQ", ["## 🪙", "## 💸"])
+    # ── หุ้น US ──
+    us_market_usd = 0.0
     if us_rows:
         out.append("📈 <b>หุ้น US</b>")
+        us_cost_total_usd = 0.0
         for r in us_rows:
-            if len(r) >= 3:
-                out.append(f"  • {r[0]}: {r[1]} หุ้น @ ${r[2]}")
+            if len(r) < 3:
+                continue
+            ticker, shares_str, cost_str = r[0], r[1], r[2]
+            shares = _parse_num(shares_str)
+            cost_usd = _parse_num(cost_str)
+            price = prices.get(ticker)
+            if price is not None and shares is not None and cost_usd is not None:
+                market_usd = shares * price
+                us_market_usd += market_usd
+                us_cost_total_usd += shares * cost_usd
+                out.append(
+                    f"  • {ticker}: {shares_str} หุ้น @ ${price:.2f} "
+                    f"(ต้นทุน ${cost_str}) | มูลค่า ${market_usd:.2f}"
+                )
+            else:
+                if shares is not None and cost_usd is not None:
+                    us_cost_total_usd += shares * cost_usd
+                out.append(f"  • {ticker}: {shares_str} หุ้น @ ${cost_str} (ราคาไม่พร้อมใช้งาน)")
+        out.append("━━━━━━━━━━━━")
+        us_market_thb = us_market_usd * usdthb
+        pnl_usd = us_market_usd - us_cost_total_usd
+        pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
+        out.append(
+            f"📊 รวมหุ้น US: ${us_market_usd:.2f} | ≈ ฿{us_market_thb:,.0f} "
+            f"(อัตรา ฿{usdthb:.2f}/$)"
+        )
         out.append("")
+    else:
+        us_market_thb = 0.0
 
+    # ── กองทุน ──
+    fund_total = 0.0
     fund_rows = get_table(content, "กองทุน (Funds)", ["## 💸"])
     if fund_rows:
         out.append("🪙 <b>กองทุน</b>")
         for r in fund_rows:
             if len(r) >= 4:
                 out.append(f"  • {r[0]}: DCA ฿{r[3]} {r[2]}")
+                v = _parse_num(r[1])
+                if v is not None:
+                    fund_total += v
         out.append("")
 
+    # ── หนี้สิน ──
+    debt_total = 0.0
     debt_rows = get_table(content, "หนี้สิน (Liabilities)", ["## "])
     if debt_rows:
         out.append("💸 <b>หนี้สิน</b>")
-        total_str = net_str = ""
+        total_str = ""
         for r in debt_rows:
             name = r[0] if r else ""
             if "รวมหนี้สิน" in name and len(r) >= 2:
                 total_str = r[1].rstrip("+")
-            elif "มูลค่าสุทธิ" in name and len(r) >= 2:
-                net_str = r[1]
+                v = _parse_num(total_str)
+                if v is not None:
+                    debt_total = v
+            elif "มูลค่าสุทธิ" in name:
+                pass  # skip stored value; recompute below
             elif not name.startswith("รวม") and len(r) >= 2:
                 note = f" ({r[3]})" if len(r) > 3 and r[3].strip() else ""
                 out.append(f"  • {r[0]}: {r[1]} ฿{note}")
@@ -436,8 +545,12 @@ def handle_assets():
             out.append("━━━━━━━━━━━━")
             out.append(f"🔴 รวมหนี้สิน: <b>{total_str} ฿</b>")
         out.append("")
-        if net_str:
-            out.append(f"📊 <b>มูลค่าสุทธิ: {net_str} ฿</b>")
+
+    # ── มูลค่าสุทธิ (live) ──
+    total_assets = cash_total + set_market_thb + us_market_thb + fund_total
+    net_worth = total_assets - debt_total
+    sign = "+" if net_worth >= 0 else ""
+    out.append(f"📊 <b>มูลค่าสุทธิ (live): {sign}{net_worth:,.0f} ฿</b>")
 
     send("\n".join(out))
 
