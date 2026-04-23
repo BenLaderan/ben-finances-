@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # e.g. benladean/ben-finances
-ALLOWED_CHAT_ID = os.environ.get("CHAT_ID")  # 8711576571
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
+ALLOWED_CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
@@ -37,8 +37,23 @@ def gh_write(path, content, sha, msg):
     return r.status_code in (200, 201)
 
 
+def get_table(content, start, stops):
+    rows = []
+    active = False
+    for line in content.splitlines():
+        if start in line:
+            active = True
+            continue
+        if active and any(s in line for s in stops) and line.strip():
+            break
+        if active and line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if any(cells):
+                rows.append(cells)
+    return rows[1:] if len(rows) > 1 else []
+
+
 def handle_ledger(text):
-    # รูปแบบ: +500 ค่ากาแฟ  หรือ  -200 ค่าข้าว
     m = re.match(r"^([+-])(\d+(?:\.\d+)?)\s+(.+)$", text.strip())
     if not m:
         return False
@@ -46,18 +61,17 @@ def handle_ledger(text):
     entry_type = "income" if sign == "+" else "expense"
     today = datetime.now().strftime("%Y-%m-%d")
     new_row = f"{today},{entry_type},general,{amount},{note}\n"
-
     content, sha = gh_read("finances/ledger.csv")
     if content is None:
-        send("❌ ไม่พบไฟล์ ledger.csv ใน GitHub")
+        send("❌ ไม่พบไฟล์ ledger.csv")
         return True
-
     ok = gh_write("finances/ledger.csv", content + new_row, sha, f"ledger: {entry_type} {amount} {note}")
     if ok:
         emoji = "💰" if sign == "+" else "💸"
-        send(f"{emoji} <b>บันทึกแล้ว</b>\nประเภท: {entry_type}\nจำนวน: {amount} บาท\nหมายเหตุ: {note}\nวันที่: {today}")
+        type_th = "รายรับ" if sign == "+" else "รายจ่าย"
+        send(f"{emoji} <b>บันทึกแล้ว</b>\nประเภท: {type_th}\nจำนวน: {amount} บาท\nหมายเหตุ: {note}\nวันที่: {today}")
     else:
-        send("❌ บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง")
+        send("❌ บันทึกไม่สำเร็จ")
     return True
 
 
@@ -66,7 +80,7 @@ def handle_summary():
     if not content:
         send("❌ ไม่พบข้อมูล")
         return
-    lines = content.strip().split("\n")[1:]  # skip header
+    lines = content.strip().split("\n")[1:]
     this_month = datetime.now().strftime("%Y-%m")
     income = expense = 0.0
     for line in lines:
@@ -86,12 +100,63 @@ def handle_summary():
             pass
     net = income - expense
     sign = "+" if net >= 0 else ""
-    send(
-        f"📊 <b>สรุปเดือนนี้ ({this_month})</b>\n"
-        f"💰 รายรับ: {income:,.2f} บาท\n"
-        f"💸 รายจ่าย: {expense:,.2f} บาท\n"
-        f"📈 คงเหลือ: {sign}{net:,.2f} บาท"
-    )
+    send(f"📊 <b>สรุปเดือนนี้ ({this_month})</b>\n💰 รายรับ: {income:,.2f} บาท\n💸 รายจ่าย: {expense:,.2f} บาท\n📈 คงเหลือ: {sign}{net:,.2f} บาท")
+
+
+def handle_assets():
+    content, _ = gh_read("finances/assets.md")
+    if not content:
+        send("❌ ไม่พบไฟล์ assets.md")
+        return
+
+    out = ["💼 <b>สินทรัพย์ของเบน</b>", ""]
+
+    cash = get_table(content, "เงินในบัญชี", ["## 📈", "## 🪙", "## 💸"])
+    if cash:
+        out.append("🏦 <b>เงินสด / บัญชี</b>")
+        for r in cash:
+            if len(r) >= 2:
+                if r[0].startswith("รวม"):
+                    out.append("━━━━━━━━━━━━")
+                    out.append(f"💵 รวม: <b>{r[1]} ฿</b>")
+                else:
+                    out.append(f"  • {r[0]}: {r[1]} ฿")
+        out.append("")
+
+    set_rows = get_table(content, "### SET", ["### NYSE", "## 🪙", "## 💸"])
+    if set_rows:
+        out.append("📈 <b>หุ้น SET</b>")
+        for r in set_rows:
+            if len(r) >= 3:
+                out.append(f"  • {r[0]}: {r[1]} หุ้น @ ฿{r[2]}")
+        out.append("")
+
+    us_rows = get_table(content, "NYSE / NASDAQ", ["## 🪙", "## 💸"])
+    if us_rows:
+        out.append("📈 <b>หุ้น US</b>")
+        for r in us_rows:
+            if len(r) >= 3:
+                out.append(f"  • {r[0]}: {r[1]} หุ้น @ ${r[2]}")
+        out.append("")
+
+    fund_rows = get_table(content, "กองทุน (Funds)", ["## 💸"])
+    if fund_rows:
+        out.append("🪙 <b>กองทุน</b>")
+        for r in fund_rows:
+            if len(r) >= 4:
+                out.append(f"  • {r[0]}: DCA ฿{r[3]} {r[2]}")
+        out.append("")
+
+    debt_rows = get_table(content, "หนี้สิน (Liabilities)", ["## "])
+    if debt_rows:
+        out.append("💸 <b>หนี้สิน</b>")
+        for r in debt_rows:
+            if len(r) >= 2 and not r[0].startswith("รวม"):
+                note = f" ({r[3]})" if len(r) > 3 and r[3].strip() else ""
+                out.append(f"  • {r[0]}: {r[1]} ฿{note}")
+        out.append("")
+
+    send("\n".join(out))
 
 
 HELP_TEXT = (
@@ -106,47 +171,22 @@ HELP_TEXT = (
 )
 
 
-def handle_assets():
-    content, _ = gh_read("finances/assets.md")
-    if not content:
-        send("❌ ไม่พบไฟล์ assets.md")
-        return
-    # ส่งแค่ส่วน Net Worth Summary
-    lines = content.split("\n")
-    summary_lines = []
-    in_summary = False
-    for line in lines:
-        if "Net Worth Summary" in line:
-            in_summary = True
-        if in_summary:
-            summary_lines.append(line)
-    if summary_lines:
-        send("📊 <b>Net Worth Summary</b>\n" + "\n".join(summary_lines[2:10]))
-    else:
-        send(content[:1000])
-
-
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-
         try:
             update = json.loads(body)
         except Exception:
             return
-
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = message.get("text", "").strip()
-
         if not text or chat_id != ALLOWED_CHAT_ID:
             return
-
         if re.match(r"^[+-]\d", text):
             handle_ledger(text)
         elif text == "/summary":
