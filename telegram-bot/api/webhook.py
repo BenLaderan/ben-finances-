@@ -25,6 +25,11 @@ ACCOUNT_MAP = {
 }
 DEFAULT_ACCOUNT = "บัญชีใช้งาน"
 
+DEBT_KEYWORDS = {
+    "ค่างวดรถ": "ค่างวดรถ",
+    "spaylater": "หนี้ Spaylater",
+}
+
 
 def send(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -65,58 +70,103 @@ def get_table(content, start, stops):
     return rows[1:] if len(rows) > 1 else []
 
 
-def update_assets_balance(account_name, delta):
-    content, sha = gh_read("finances/assets.md")
-    if content is None:
+def _parse_num(s):
+    clean = s.strip().strip("*").strip("+").replace(",", "")
+    try:
+        return float(clean)
+    except ValueError:
         return None
 
-    lines = content.split("\n")
-    new_balance = None
-    updated = []
 
+def _apply_row_delta(lines, row_name, delta):
+    """Find row by name, apply delta to column-2. Returns (new_lines, old_val, new_val)."""
+    old_val = new_val = None
+    result = []
     for line in lines:
         if line.startswith("|") and "---" not in line:
             cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
-            if cells and cells[0] == account_name and len(cells) >= 2:
-                try:
-                    current = float(cells[1].replace(",", ""))
-                    new_balance = current + delta
+            if cells and cells[0] == row_name and len(cells) >= 2:
+                v = _parse_num(cells[1])
+                if v is not None:
+                    old_val = v
+                    new_val = v + delta
                     parts = line.split("|")
-                    parts[2] = f" {new_balance:,.2f} "
+                    parts[2] = f" {new_val:,.2f} "
                     line = "|".join(parts)
-                except ValueError:
-                    pass
-        updated.append(line)
+        result.append(line)
+    return result, old_val, new_val
 
-    if new_balance is None:
-        return None
 
-    # Recalculate cash total
+def _recalc_total(lines, section_marker, total_marker):
+    """Sum all data rows in section, write back to total row. Appends '+' if any row has '-'."""
     total = 0.0
-    in_cash = False
-    for line in updated:
-        if "## 🏦" in line:
-            in_cash = True
-        elif in_cash and line.startswith("## "):
-            in_cash = False
-        elif in_cash and line.startswith("|") and "---" not in line:
-            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
-            if cells and cells[0] and not cells[0].startswith("รวม") and cells[0] != "รายการ" and len(cells) >= 2:
-                try:
-                    total += float(cells[1].replace(",", ""))
-                except ValueError:
-                    pass
+    has_unknown = False
+    in_section = False
+    SKIP = {"รายการ", "กองทุน", "Ticker", ""}
 
+    for line in lines:
+        if section_marker in line:
+            in_section = True
+        elif in_section and line.startswith("## "):
+            in_section = False
+        elif in_section and line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if not cells or cells[0] in SKIP or cells[0].startswith("รวม"):
+                continue
+            if len(cells) >= 2:
+                v = _parse_num(cells[1])
+                if v is not None:
+                    total += v
+                elif cells[1].strip() not in ("", "-"):
+                    pass
+                else:
+                    has_unknown = True
+
+    total_str = f"{total:,.2f}+" if has_unknown else f"{total:,.2f}"
     final = []
-    for line in updated:
-        if line.startswith("|") and "รวมเงินสด/บัญชี" in line:
+    for line in lines:
+        if line.startswith("|") and total_marker in line:
             parts = line.split("|")
-            parts[2] = f" **{total:,.2f}** "
+            parts[2] = f" **{total_str}** "
             line = "|".join(parts)
         final.append(line)
+    return final, total
 
-    gh_write("finances/assets.md", "\n".join(final), sha, f"assets: {account_name} {delta:+.2f}")
-    return new_balance
+
+def update_cash_account(content, sha, account_name, delta):
+    """Update cash account balance + recalculate รวมเงินสด/บัญชี. Returns (new_content, new_sha, old, new)."""
+    lines, old_val, new_val = _apply_row_delta(content.split("\n"), account_name, delta)
+    if new_val is None:
+        return content, sha, None, None
+    lines, _ = _recalc_total(lines, "## 🏦", "รวมเงินสด/บัญชี")
+    new_content = "\n".join(lines)
+    new_sha = sha
+    if gh_write("finances/assets.md", new_content, sha, f"assets: {account_name} {delta:+.2f}"):
+        _, new_sha = gh_read("finances/assets.md")
+        new_sha = new_sha or sha
+    return new_content, new_sha, old_val, new_val
+
+
+def update_debt(content, sha, debt_name, delta):
+    """Reduce debt balance + recalculate รวมหนี้สิน. Returns (new_content, new_sha, old, new)."""
+    lines, old_val, new_val = _apply_row_delta(content.split("\n"), debt_name, delta)
+    if new_val is None:
+        return content, sha, None, None
+    lines, _ = _recalc_total(lines, "หนี้สิน (Liabilities)", "รวมหนี้สิน")
+    new_content = "\n".join(lines)
+    new_sha = sha
+    if gh_write("finances/assets.md", new_content, sha, f"assets: debt {debt_name} {delta:+.2f}"):
+        _, new_sha = gh_read("finances/assets.md")
+        new_sha = new_sha or sha
+    return new_content, new_sha, old_val, new_val
+
+
+def detect_debt(note):
+    note_lower = note.lower()
+    for keyword, debt_name in DEBT_KEYWORDS.items():
+        if keyword in note_lower:
+            return debt_name
+    return None
 
 
 def handle_ledger(text):
@@ -133,34 +183,66 @@ def handle_ledger(text):
     today = datetime.now().strftime("%Y-%m-%d")
     new_row = f"{today},{entry_type},general,{amount},{note}\n"
 
-    content, sha = gh_read("finances/ledger.csv")
-    if content is None:
+    ledger_content, ledger_sha = gh_read("finances/ledger.csv")
+    if ledger_content is None:
         send("❌ ไม่พบไฟล์ ledger.csv")
         return True
-    ok = gh_write("finances/ledger.csv", content + new_row, sha, f"ledger: {entry_type} {amount} {note}")
-    if not ok:
+    if not gh_write("finances/ledger.csv", ledger_content + new_row, ledger_sha, f"ledger: {entry_type} {amount} {note}"):
         send("❌ บันทึก ledger ไม่สำเร็จ")
         return True
 
-    delta = float(amount) if sign == "+" else -float(amount)
-    new_balance = update_assets_balance(account, delta)
+    assets_content, assets_sha = gh_read("finances/assets.md")
+    if assets_content is None:
+        send("❌ ไม่พบไฟล์ assets.md")
+        return True
 
+    delta = float(amount) if sign == "+" else -float(amount)
     emoji = "💰" if sign == "+" else "💸"
     type_th = "รายรับ" if sign == "+" else "รายจ่าย"
+    debt_name = detect_debt(note) if sign == "-" else None
 
-    if new_balance is not None:
-        bal_line = f"บัญชี: {account} → {new_balance:,.2f} ฿"
+    if debt_name:
+        # Step 1: deduct from cash account
+        assets_content, assets_sha, acct_old, acct_new = update_cash_account(
+            assets_content, assets_sha, account, delta
+        )
+        # Step 2: reduce debt balance (re-read to get fresh SHA after step 1 write)
+        fresh_content, fresh_sha = gh_read("finances/assets.md")
+        if fresh_content:
+            assets_content, assets_sha = fresh_content, fresh_sha
+        _, _, debt_old, debt_new = update_debt(assets_content, assets_sha, debt_name, delta)
+
+        acct_line = (
+            f"{account}: {acct_old:,.2f} → {acct_new:,.2f} ฿ (ลดลง {float(amount):,.0f})"
+            if acct_old is not None else f"{account}: อัพเดทไม่สำเร็จ"
+        )
+        debt_line = (
+            f"{debt_name}: {debt_old:,.2f} → {debt_new:,.2f} ฿ (ลดลง {float(amount):,.0f})"
+            if debt_old is not None else f"{debt_name}: อัพเดทไม่สำเร็จ"
+        )
+        send(
+            f"{emoji} <b>บันทึกแล้ว</b>\n"
+            f"ประเภท: {type_th} (จ่ายหนี้)\n"
+            f"จำนวน: {float(amount):,.0f} บาท\n"
+            f"หมายเหตุ: {note}\n"
+            f"{acct_line}\n"
+            f"{debt_line}\n"
+            f"วันที่: {today}"
+        )
     else:
-        bal_line = f"บัญชี: {account} (อัพเดท assets ไม่สำเร็จ)"
-
-    send(
-        f"{emoji} <b>บันทึกแล้ว</b>\n"
-        f"ประเภท: {type_th}\n"
-        f"จำนวน: {amount} บาท\n"
-        f"หมายเหตุ: {note}\n"
-        f"{bal_line}\n"
-        f"วันที่: {today}"
-    )
+        _, _, acct_old, acct_new = update_cash_account(assets_content, assets_sha, account, delta)
+        bal_line = (
+            f"บัญชี: {account} → {acct_new:,.2f} ฿"
+            if acct_new is not None else f"บัญชี: {account} (อัพเดท assets ไม่สำเร็จ)"
+        )
+        send(
+            f"{emoji} <b>บันทึกแล้ว</b>\n"
+            f"ประเภท: {type_th}\n"
+            f"จำนวน: {float(amount):,.2f} บาท\n"
+            f"หมายเหตุ: {note}\n"
+            f"{bal_line}\n"
+            f"วันที่: {today}"
+        )
     return True
 
 
@@ -254,6 +336,7 @@ HELP_TEXT = (
     "+500 เงินเดือน — บันทึกรายรับ (ตัด บัญชีใช้งาน)\n"
     "-200 ค่าอาหาร — บันทึกรายจ่าย (ตัด บัญชีใช้งาน)\n"
     "-200 ค่าอาหาร [เงินสด] — ระบุบัญชี\n"
+    "-8218 ค่างวดรถ — จ่ายหนี้ (อัพเดทยอดหนี้อัตโนมัติ)\n"
     "บัญชีที่รองรับ: บัญชีเงินเย็น, บัญชีใช้งาน, Prepaid Card, เงินสด, เงินในพอร์ตลงทุน\n\n"
     "/summary — สรุปรายรับจ่ายเดือนนี้\n\n"
     "<b>พอร์ต:</b>\n"
