@@ -170,22 +170,31 @@ def _recalc_total(lines, section_marker, total_marker):
     return final, total
 
 
-def _update_car_note(lines):
-    """Decrement 'เหลืออีก X งวด' in ค่างวดรถ note column. Returns (lines, note_str)."""
+def _update_car_note(lines, direction=-1):
+    """Update 'เหลืออีก X งวด'. direction=-1 to decrement (pay), +1 to increment (reverse).
+    Returns (lines, old_note, new_note).
+    """
     result = []
-    note_str = ""
+    old_note = new_note = ""
     for line in lines:
         if line.startswith("|") and "ค่างวดรถ" in line and "---" not in line:
             parts = line.split("|")
             if len(parts) >= 5:
                 m = re.search(r"เหลืออีก\s+(\d+)\s+งวด", parts[4])
                 if m:
-                    remaining = int(m.group(1)) - 1
-                    note_str = "ชำระครบแล้ว" if remaining <= 0 else f"เหลืออีก {remaining} งวด"
-                    parts[4] = f" {note_str} "
+                    current = int(m.group(1))
+                    old_note = f"เหลืออีก {current} งวด"
+                    new_count = current + direction
+                    new_note = "ชำระครบแล้ว" if new_count <= 0 else f"เหลืออีก {new_count} งวด"
+                    parts[4] = f" {new_note} "
+                    line = "|".join(parts)
+                elif "ชำระครบแล้ว" in parts[4] and direction > 0:
+                    old_note = "ชำระครบแล้ว"
+                    new_note = "เหลืออีก 1 งวด"
+                    parts[4] = f" {new_note} "
                     line = "|".join(parts)
         result.append(line)
-    return result, note_str
+    return result, old_note, new_note
 
 
 def _calc_net_worth(lines):
@@ -270,18 +279,19 @@ def _recalc_net_worth_row(lines):
 
 def update_assets_on_ledger(content, sha, account, delta, debt_name=None):
     """Apply all ledger changes to assets.md in one write.
-    Returns (acct_old, acct_new, debt_old, debt_new, car_note).
+    Returns (acct_old, acct_new, debt_old, debt_new, old_car_note, new_car_note).
     """
     lines = content.split("\n")
 
     lines, acct_old, acct_new = _apply_row_delta(lines, account, delta)
 
     debt_old = debt_new = None
-    car_note = ""
+    old_car_note = new_car_note = ""
     if debt_name:
         lines, debt_old, debt_new = _apply_row_delta(lines, debt_name, delta)
         if debt_name == "ค่างวดรถ":
-            lines, car_note = _update_car_note(lines)
+            direction = -1 if delta < 0 else +1
+            lines, old_car_note, new_car_note = _update_car_note(lines, direction)
         lines, _ = _recalc_total(lines, "หนี้สิน (Liabilities)", "รวมหนี้สิน")
 
     lines, _ = _recalc_total(lines, "## 🏦", "รวมเงินสด/บัญชี")
@@ -292,7 +302,7 @@ def update_assets_on_ledger(content, sha, account, delta, debt_name=None):
         else f"assets: {account} {delta:+.2f}"
     )
     gh_write("finances/assets.md", "\n".join(lines), sha, commit_msg)
-    return acct_old, acct_new, debt_old, debt_new, car_note
+    return acct_old, acct_new, debt_old, debt_new, old_car_note, new_car_note
 
 
 # ─── Command handlers ─────────────────────────────────────────────────────────
@@ -333,13 +343,14 @@ def handle_ledger(text):
         return True
 
     delta = float(amount) if sign == "+" else -float(amount)
-    debt_name = detect_debt(note) if sign == "-" else None
+    debt_name = detect_debt(note)
 
-    acct_old, acct_new, debt_old, debt_new, car_note = update_assets_on_ledger(
+    acct_old, acct_new, debt_old, debt_new, old_car_note, new_car_note = update_assets_on_ledger(
         assets_content, assets_sha, account, delta, debt_name
     )
 
-    emoji = "💰" if sign == "+" else "💸"
+    is_reversal = sign == "+" and debt_name is not None
+    emoji = "↩️" if is_reversal else ("💰" if sign == "+" else "💸")
     type_th = "รายรับ" if sign == "+" else "รายจ่าย"
 
     if debt_name:
@@ -351,15 +362,15 @@ def handle_ledger(text):
             f"{debt_name}: {debt_old:,.2f} → {debt_new:,.2f} ฿"
             if debt_old is not None else f"{debt_name}: อัพเดทไม่สำเร็จ"
         )
+        header = "ยกเลิกรายการ" if is_reversal else f"บันทึกแล้ว</b>\nประเภท: {type_th} (จ่ายหนี้)"
         parts = [
-            f"{emoji} <b>บันทึกแล้ว</b>",
-            f"ประเภท: {type_th} (จ่ายหนี้)",
+            f"{emoji} <b>{header}",
             f"จำนวน: {float(amount):,.0f} บาท",
             acct_line,
             debt_line,
         ]
-        if car_note:
-            parts.append(car_note)
+        if old_car_note and new_car_note:
+            parts.append(f"{old_car_note} → {new_car_note}")
         parts.append(f"วันที่: {today}")
         send("\n".join(parts))
     else:
@@ -517,10 +528,11 @@ def handle_assets():
         out.append("🪙 <b>กองทุน</b>")
         for r in fund_rows:
             if len(r) >= 4:
-                out.append(f"  • {r[0]}: DCA ฿{r[3]} {r[2]}")
-                v = _parse_num(r[1])
-                if v is not None:
-                    fund_total += v
+                v = _parse_num(r[1]) or 0.0
+                fund_total += v
+                out.append(f"  • {r[0]}: ฿{v:,.2f} | DCA ฿{r[3]} {r[2]}")
+        out.append("━━━━━━━━━━━━")
+        out.append(f"💰 รวมกองทุน: ฿{fund_total:,.2f}")
         out.append("")
 
     # ── หนี้สิน ──
@@ -555,6 +567,54 @@ def handle_assets():
     send("\n".join(out))
 
 
+def handle_fund(text):
+    m = re.match(r"^/fund\s+(\S+)\s+(\d+(?:\.\d+)?)\s*$", text.strip())
+    if not m:
+        send("รูปแบบ: /fund [ชื่อกองทุน] [มูลค่า]\nตัวอย่าง: /fund SCBworld 788.53")
+        return
+    name_raw, value_str = m.groups()
+    value = float(value_str)
+
+    FUND_MAP = {
+        "scbworld": "SCBworld(A)",
+        "scbs&p500": "SCBS&P500(A)",
+        "scbsp500": "SCBS&P500(A)",
+        "SCBworld": "SCBworld(A)",
+        "SCBS&P500": "SCBS&P500(A)",
+    }
+    fund_full = FUND_MAP.get(name_raw, FUND_MAP.get(name_raw.lower(), name_raw))
+
+    content, sha = gh_read("finances/assets.md")
+    if content is None:
+        send("❌ ไม่พบไฟล์ assets.md")
+        return
+
+    lines = content.split("\n")
+    old_val = new_val = None
+    updated = []
+    for line in lines:
+        if line.startswith("|") and "---" not in line:
+            cells = [c.strip().strip("*") for c in line.strip().strip("|").split("|")]
+            if cells and cells[0] == fund_full and len(cells) >= 2:
+                old_val = _parse_num(cells[1])
+                new_val = value
+                parts = line.split("|")
+                parts[2] = f" {new_val:,.2f} "
+                line = "|".join(parts)
+        updated.append(line)
+
+    if new_val is None:
+        send(f"❌ ไม่พบกองทุน '{fund_full}'\nกองทุนที่รองรับ: SCBworld, SCBS&P500")
+        return
+
+    updated = _recalc_net_worth_row(updated)
+    if gh_write("finances/assets.md", "\n".join(updated), sha, f"assets: fund {fund_full} = {value}"):
+        old_str = f"{old_val:,.2f}" if old_val is not None else "?"
+        send(f"🪙 <b>อัพเดทกองทุนแล้ว</b>\n{fund_full}: {old_str} → {new_val:,.2f} ฿")
+    else:
+        send("❌ อัพเดทไม่สำเร็จ")
+
+
 HELP_TEXT = (
     "📋 <b>คำสั่งทั้งหมด</b>\n\n"
     "<b>บัญชี:</b>\n"
@@ -562,10 +622,12 @@ HELP_TEXT = (
     "-200 ค่าอาหาร — บันทึกรายจ่าย (ตัด บัญชีใช้งาน)\n"
     "-200 ค่าอาหาร [เงินสด] — ระบุบัญชี\n"
     "-8218 ค่างวดรถ — จ่ายหนี้ (อัพเดทยอดหนี้ + งวด)\n"
+    "+8218 ค่างวดรถ — ยกเลิก/แก้ไขรายการ\n"
     "บัญชีที่รองรับ: บัญชีเงินเย็น, บัญชีใช้งาน, Prepaid Card, เงินสด, เงินในพอร์ตลงทุน\n\n"
     "/summary — สรุปรายรับจ่ายเดือนนี้\n\n"
     "<b>พอร์ต:</b>\n"
-    "/assets — ดูสรุปสินทรัพย์\n\n"
+    "/assets — ดูสรุปสินทรัพย์\n"
+    "/fund SCBworld 788.53 — อัพเดทมูลค่ากองทุน\n\n"
     "/help — แสดงเมนูนี้"
 )
 
@@ -592,6 +654,8 @@ class handler(BaseHTTPRequestHandler):
             handle_summary()
         elif text == "/assets":
             handle_assets()
+        elif text.startswith("/fund"):
+            handle_fund(text)
         elif text in ("/help", "/start"):
             send(HELP_TEXT)
         else:
