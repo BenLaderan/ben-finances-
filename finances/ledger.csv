@@ -98,3 +98,4 @@ date,type,category,amount,note
 2026-04-30,expense,stock,19.97,ซื้อ NVDA
 2026-04-30,income,stock,85.59,ขาย DOCN
 2026-04-30,expense,stock,85.29,ซื้อ MRSH
+2026-04-30,income,general,85.29,clear balance
