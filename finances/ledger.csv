@@ -136,3 +136,4 @@ date,type,category,amount,note
 2026-05-06,expense,stock,6.10,ซื้อ BWXT
 2026-05-06,expense,stock,8.56,ซื้อ LEU
 2026-05-06,income,general,3263.72,clear balance
+2026-05-06,expense,general,3263.72,clear balance
